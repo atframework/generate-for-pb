@@ -206,7 +206,7 @@ class MakoModuleTempDir:
 def PbMsgPbFieldIsRepeated(field):
     import google.protobuf
     version = google.protobuf.__version__
-    if version >= '7.0.0':
+    if [int(x) for x in version.split(".")] >= [7, 0, 0]:
         return field.is_repeated
 
     pb2 = _get_pb2_module()
