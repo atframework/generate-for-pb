@@ -397,7 +397,7 @@ class GeneratorIpcClientTest(unittest.TestCase):
                     "127.0.0.1:{0}".format(occupied_port),
                     5,
                     str(pid_file),
-                    os.path.realpath(sys.executable),
+                    generator_ipc._get_process_image_path(os.getpid()),
                     str(port_file),
                     True,
                 )

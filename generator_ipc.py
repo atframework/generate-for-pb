@@ -641,8 +641,6 @@ def _get_posix_process_image_path(pid):
 
 
 def _get_process_image_path(pid):
-    if int(pid) == os.getpid():
-        return os.path.realpath(sys.executable)
     if os.name == "nt":
         return _get_windows_process_image_path(pid)
     return _get_posix_process_image_path(pid)
