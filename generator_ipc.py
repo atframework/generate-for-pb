@@ -502,12 +502,16 @@ def _write_pid_file(pid_file, pid):
 def _remove_pid_file_if_match(pid_file, pid):
     if not pid_file:
         return
-    if _read_pid_file(pid_file) != pid:
-        return
-    try:
-        os.remove(pid_file)
-    except EnvironmentError:
-        pass
+    for attempt in range(4):
+        if _read_pid_file(pid_file) != pid:
+            return
+        try:
+            os.remove(pid_file)
+            return
+        except EnvironmentError:
+            if attempt >= 3:
+                return
+            time.sleep(0.2)
 
 
 def _sanitize_server_address_for_path(address):
@@ -670,6 +674,24 @@ def _check_pid_file_process(pid_file, expected_process_path):
                 pid, process_path, expected_process_path),
         )
     return (True, None)
+
+
+def _discard_stale_pid_file(pid_file, expected_process_path):
+    if not pid_file:
+        return
+    pid = _read_pid_file(pid_file)
+    if pid is None:
+        _remove_pid_file(pid_file)
+        return
+    process_path = _get_process_image_path(pid)
+    if not process_path:
+        _remove_pid_file(pid_file)
+        return
+    normalized_process_path = _normalize_process_image_path(process_path)
+    normalized_expected_path = _normalize_process_image_path(
+        expected_process_path)
+    if normalized_expected_path and normalized_process_path != normalized_expected_path:
+        _remove_pid_file(pid_file)
 
 
 def _check_server_ping_response(response, pid_file, expected_process_path):
@@ -962,7 +984,10 @@ def run_generation_request(request, main_func):
 
 
 class _GeneratorServer(socketserver.TCPServer):
-    allow_reuse_address = True
+    # On Windows SO_REUSEADDR allows binding a port that is already actively
+    # listened on, which would let multiple generator servers share one port
+    # and make client connections route to an arbitrary one.
+    allow_reuse_address = os.name != "nt"
     request_queue_size = 128
 
     def __init__(self, server_address, request_handler_class,
@@ -1088,6 +1113,19 @@ def run_generator_server(address,
             "[ERROR]: write generator server state files failed: {0}\n".
             format(e))
         return 1
+    entry_script_directory = ""
+    if sys.argv and sys.argv[0]:
+        entry_script_directory = os.path.dirname(os.path.abspath(sys.argv[0]))
+    sys.stdout.write(
+        "[INFO]: generator server working directory: {0}\n".format(
+            current_cwd))
+    if entry_script_directory:
+        sys.stdout.write(
+            "[INFO]: generator server entry script directory: {0}\n".format(
+                entry_script_directory))
+    sys.stdout.write(
+        "[INFO]: generator server startup arguments: {0}\n".format(
+            " ".join(sys.argv)))
     sys.stdout.write(
         "[INFO]: generator server listening on {0}:{1}\n".format(host, port))
     sys.stdout.flush()
@@ -1180,6 +1218,7 @@ def _wait_generator_server_ready(address,
                 pid_file_ready, pid_file_error = _check_pid_file_process(
                     pid_file, expected_process_path)
                 if not pid_file_ready:
+                    _discard_stale_pid_file(pid_file, expected_process_path)
                     last_error = RuntimeError(pid_file_error)
                     time.sleep(0.05)
                     continue
@@ -1243,6 +1282,10 @@ def run_generator_client(address,
             pid_file_ready, pid_file_error = _check_pid_file_process(
                 pid_file, expected_process_path)
             if not pid_file_ready:
+                if not shutdown:
+                    _discard_stale_pid_file(pid_file, expected_process_path)
+                    _remove_server_port_file_if_match(
+                        port_file, _read_server_port_file(port_file))
                 raise RuntimeError(pid_file_error)
             _ping_generator_server(resolved_address, connect_timeout, timeout,
                                    pid_file, expected_process_path)
@@ -1321,6 +1364,10 @@ def run_generator_client(address,
                                 pass
 
                 if not server_ready:
+                    _discard_stale_pid_file(pid_file, expected_process_path)
+                    if pid_file:
+                        _remove_server_port_file_if_match(
+                            port_file, _read_server_port_file(port_file))
                     bootstrap_args = collect_generator_server_bootstrap_args(
                         argv)
                     _start_generator_server(
