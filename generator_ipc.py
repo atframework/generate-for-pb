@@ -29,6 +29,7 @@ GENERATOR_IPC_DEFAULT_TIMEOUT = 300.0
 GENERATOR_IPC_DEFAULT_IDLE_TIMEOUT = 600.0
 _GENERATOR_IPC_LENGTH_STRUCT = struct.Struct("!I")
 _GENERATOR_IPC_SERVER_STARTUP_LOCK_SUFFIX = ".startup.lock"
+_GENERATOR_IPC_SERVER_LOG_FILE_NAME = "generate-for-pb-run-server.log"
 _GENERATOR_IPC_ALWAYS_REUSE_MODULE_PREFIXES = (
     "google",
     "_yaml",
@@ -653,7 +654,14 @@ def _get_process_image_path(pid):
 def _normalize_process_image_path(process_path):
     if not process_path:
         return None
-    return os.path.normcase(os.path.realpath(os.path.abspath(process_path)))
+    normalized = os.path.normcase(
+        os.path.realpath(os.path.abspath(process_path)))
+    # Treat pythonw.exe and python.exe from the same installation as
+    # equivalent: the generator server may be launched through pythonw.exe to
+    # avoid a console window while clients run under python.exe.
+    if os.path.basename(normalized) == "pythonw.exe":
+        normalized = os.path.join(os.path.dirname(normalized), "python.exe")
+    return normalized
 
 
 def _check_pid_file_process(pid_file, expected_process_path):
@@ -782,6 +790,87 @@ def collect_generator_server_bootstrap_args(argv):
     # applied inside run_generation_request(), so they do not need to become
     # part of the server's long-lived baseline environment.
     return []
+
+
+class _GeneratorServerLogTee(object):
+    """Mirror server output into the server log file, and also into the
+    console stream when the server was started from a real terminal."""
+
+    def __init__(self, console_stream, log_stream):
+        self._console_stream = console_stream
+        self._log_stream = log_stream
+        self._pending_line = ""
+
+    @staticmethod
+    def _timestamp_prefix():
+        now = time.time()
+        return "[{0}.{1:03d}] ".format(
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            int(now * 1000) % 1000,
+        )
+
+    def _write_streams(self, data):
+        if self._console_stream is not None:
+            try:
+                self._console_stream.write(data)
+            except (EnvironmentError, ValueError):
+                pass
+        try:
+            self._log_stream.write(data)
+        except (EnvironmentError, ValueError):
+            pass
+
+    def write(self, data):
+        if not data:
+            return 0
+        self._pending_line += data
+        lines = []
+        newline_index = self._pending_line.find("\n")
+        while newline_index >= 0:
+            lines.append(self._pending_line[:newline_index + 1])
+            self._pending_line = self._pending_line[newline_index + 1:]
+            newline_index = self._pending_line.find("\n")
+        if lines:
+            self._write_streams("".join(
+                self._timestamp_prefix() + line for line in lines))
+        return len(data)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        if self._pending_line:
+            self._write_streams(self._timestamp_prefix() + self._pending_line)
+            self._pending_line = ""
+        if self._console_stream is not None:
+            try:
+                self._console_stream.flush()
+            except (EnvironmentError, ValueError):
+                pass
+        try:
+            self._log_stream.flush()
+        except (EnvironmentError, ValueError):
+            pass
+
+    def isatty(self):
+        if self._console_stream is None:
+            return False
+        isatty_fn = getattr(self._console_stream, "isatty", None)
+        return bool(isatty_fn and isatty_fn())
+
+    @property
+    def encoding(self):
+        if self._console_stream is not None:
+            return getattr(self._console_stream, "encoding", None) or "utf-8"
+        return "utf-8"
+
+
+def _wrap_generator_server_log_stream(console_stream, log_stream):
+    isatty_fn = getattr(console_stream, "isatty", None)
+    if console_stream is None or not (isatty_fn and isatty_fn()):
+        console_stream = None
+    return _GeneratorServerLogTee(console_stream, log_stream)
 
 
 def _recv_exact(sock, size):
@@ -990,6 +1079,19 @@ class _GeneratorServer(socketserver.TCPServer):
     allow_reuse_address = os.name != "nt"
     request_queue_size = 128
 
+    def handle_error(self, request, client_address):
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, ConnectionError):
+            # The server is single-threaded: while it is busy with a generate
+            # request, ping/readiness connections queue up and their clients
+            # may time out and disconnect before the response is sent.
+            sys.stdout.write(
+                "[INFO]: generator client {0} disconnected before receiving response, ignore.\n"
+                .format(client_address))
+            sys.stdout.flush()
+            return
+        socketserver.TCPServer.handle_error(self, request, client_address)
+
     def __init__(self, server_address, request_handler_class,
                  request_callback, idle_timeout):
         socketserver.TCPServer.__init__(self, server_address,
@@ -1064,12 +1166,69 @@ def _run_idle_monitor(server):
         return
 
 
+def _free_spurious_windows_console():
+    if os.name != "nt":
+        return
+    try:
+        isatty_fn = getattr(sys.stdout, "isatty", None)
+        if isatty_fn and isatty_fn():
+            return
+    except BaseException:
+        pass
+    try:
+        import ctypes
+
+        ctypes.WinDLL("kernel32", use_last_error=True).FreeConsole()
+    except BaseException:
+        pass
+
+
 def run_generator_server(address,
                          idle_timeout,
                          request_callback,
                          pid_file=None,
                          port_file=None,
                          port_range=None):
+    idle_timeout = normalize_timeout(idle_timeout,
+                                     GENERATOR_IPC_DEFAULT_IDLE_TIMEOUT)
+    _free_spurious_windows_console()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    server_log_stream = None
+    try:
+        try:
+            server_log_stream = open(
+                os.path.join(os.getcwd(),
+                             _GENERATOR_IPC_SERVER_LOG_FILE_NAME),
+                "w",
+                encoding="utf-8",
+                errors="replace",
+            )
+            sys.stdout = _wrap_generator_server_log_stream(
+                original_stdout, server_log_stream)
+            sys.stderr = _wrap_generator_server_log_stream(
+                original_stderr, server_log_stream)
+        except EnvironmentError:
+            server_log_stream = None
+        return _run_generator_server_impl(address, idle_timeout,
+                                          request_callback, pid_file,
+                                          port_file, port_range)
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        if server_log_stream is not None:
+            try:
+                server_log_stream.close()
+            except EnvironmentError:
+                pass
+
+
+def _run_generator_server_impl(address,
+                               idle_timeout,
+                               request_callback,
+                               pid_file=None,
+                               port_file=None,
+                               port_range=None):
     idle_timeout = normalize_timeout(idle_timeout,
                                      GENERATOR_IPC_DEFAULT_IDLE_TIMEOUT)
     current_cwd = os.getcwd()
@@ -1116,18 +1275,12 @@ def run_generator_server(address,
     entry_script_directory = ""
     if sys.argv and sys.argv[0]:
         entry_script_directory = os.path.dirname(os.path.abspath(sys.argv[0]))
-    sys.stdout.write(
-        "[INFO]: generator server working directory: {0}\n".format(
-            current_cwd))
+    sys.stdout.write("[INFO]: generator server:\n")
+    sys.stdout.write("\tworking directory: {0}\n".format(current_cwd))
     if entry_script_directory:
-        sys.stdout.write(
-            "[INFO]: generator server entry script directory: {0}\n".format(
-                entry_script_directory))
-    sys.stdout.write(
-        "[INFO]: generator server startup arguments: {0}\n".format(
-            " ".join(sys.argv)))
-    sys.stdout.write(
-        "[INFO]: generator server listening on {0}:{1}\n".format(host, port))
+        sys.stdout.write("\tentry script directory: {0}\n".format(entry_script_directory))
+    sys.stdout.write("\tstartup arguments: {0}\n".format(" ".join(sys.argv)))
+    sys.stdout.write("\tlistening on {0}:{1}\n".format(host, port))
     sys.stdout.flush()
     idle_monitor = threading.Thread(target=_run_idle_monitor, args=[server])
     idle_monitor.daemon = True
@@ -1155,14 +1308,30 @@ def _connect_and_request(address, connect_timeout, read_timeout, request):
         sock.close()
 
 
+def _get_windows_no_window_interpreter(executable):
+    if os.name != "nt" or not executable:
+        return executable
+    if os.path.basename(executable).lower() == "pythonw.exe":
+        return executable
+    candidate = os.path.join(os.path.dirname(os.path.abspath(executable)),
+                             "pythonw.exe")
+    if os.path.exists(candidate):
+        return candidate
+    return executable
+
+
 def _start_generator_server(server_program, address, idle_timeout, cwd,
                             bootstrap_args, pid_file, port_file,
                             port_range):
     if not server_program:
         raise RuntimeError("can not auto start generator server without script path")
 
+    # The venv redirector (CPython 3.13+) re-spawns the real interpreter as a
+    # child process without propagating DETACHED_PROCESS/CREATE_NO_WINDOW, so a
+    # console-subsystem grandchild would allocate its own console window.
+    # Launching through pythonw.exe keeps the whole chain GUI-subsystem.
     server_args = [
-        sys.executable,
+        _get_windows_no_window_interpreter(sys.executable),
         server_program,
         "--server-mode",
         "--server-address",

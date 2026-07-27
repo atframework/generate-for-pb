@@ -258,6 +258,37 @@ class GeneratorIpcClientTest(unittest.TestCase):
         self.assertEqual(0x1, popen_kwargs["startupinfo"].dwFlags & 0x1)
         self.assertEqual(0, popen_kwargs["startupinfo"].wShowWindow)
 
+    def test_get_windows_no_window_interpreter_prefers_pythonw(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            python_exe = Path(temp_dir) / "python.exe"
+            pythonw_exe = Path(temp_dir) / "pythonw.exe"
+            python_exe.write_text("", encoding="utf-8")
+            with mock.patch.object(generator_ipc.os, "name", "nt"):
+                self.assertEqual(
+                    str(python_exe),
+                    generator_ipc._get_windows_no_window_interpreter(
+                        str(python_exe)),
+                )
+                pythonw_exe.write_text("", encoding="utf-8")
+                self.assertEqual(
+                    str(pythonw_exe),
+                    generator_ipc._get_windows_no_window_interpreter(
+                        str(python_exe)),
+                )
+                self.assertEqual(
+                    str(pythonw_exe),
+                    generator_ipc._get_windows_no_window_interpreter(
+                        str(pythonw_exe)),
+                )
+
+    def test_normalize_process_image_path_treats_pythonw_as_python(self):
+        python_exe = os.path.join("some", "dir", "python.exe")
+        pythonw_exe = os.path.join("some", "dir", "pythonw.exe")
+        self.assertEqual(
+            generator_ipc._normalize_process_image_path(python_exe),
+            generator_ipc._normalize_process_image_path(pythonw_exe),
+        )
+
     def test_get_subprocess_no_window_kwargs_on_windows(self):
         class DummyStartupInfo(object):
 
@@ -426,6 +457,74 @@ class GeneratorIpcClientTest(unittest.TestCase):
                 self.assertEqual(0, server_result.get("returncode"))
             finally:
                 occupied_socket.close()
+
+    def test_run_generator_server_writes_and_truncates_log_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pid_file = Path(temp_dir) / "server.pid"
+            port_file = Path(temp_dir) / "server.port"
+            log_file = Path(temp_dir) / "generate-for-pb-run-server.log"
+            log_file.write_text("stale content\n", encoding="utf-8")
+            original_cwd = os.getcwd()
+            server_result = {}
+
+            def request_callback(request):
+                return generator_ipc.run_generation_request(
+                    request,
+                    lambda argv=None, display_argv=None, allow_ipc=False: 0,
+                )
+
+            os.chdir(temp_dir)
+            try:
+                server_thread = threading.Thread(
+                    target=lambda: server_result.update({
+                        "returncode": generator_ipc.run_generator_server(
+                            "127.0.0.1:0",
+                            30,
+                            request_callback,
+                            pid_file=str(pid_file),
+                            port_file=str(port_file),
+                        )
+                    }),
+                    daemon=True,
+                )
+                server_thread.start()
+                generator_ipc._wait_generator_server_ready(
+                    "127.0.0.1:0",
+                    5,
+                    str(pid_file),
+                    generator_ipc._get_process_image_path(os.getpid()),
+                    str(port_file),
+                    True,
+                )
+                shutdown_result = generator_ipc.run_generator_client(
+                    "127.0.0.1:0",
+                    5,
+                    [],
+                    temp_dir,
+                    "generator.py",
+                    True,
+                    auto_start=False,
+                    idle_timeout=1,
+                    server_program=None,
+                    pid_file=str(pid_file),
+                    port_file=str(port_file),
+                )
+                self.assertEqual(0, shutdown_result)
+                server_thread.join(5)
+                self.assertFalse(server_thread.is_alive())
+                self.assertEqual(0, server_result.get("returncode"))
+
+                log_content = log_file.read_text(encoding="utf-8")
+                self.assertNotIn("stale content", log_content)
+                self.assertIn("working directory", log_content)
+                self.assertIn("startup arguments", log_content)
+                self.assertIn("listening on", log_content)
+                self.assertRegex(
+                    log_content,
+                    r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\] ",
+                )
+            finally:
+                os.chdir(original_cwd)
 
 
 class GeneratorIpcRuntimeIsolationTest(unittest.TestCase):
