@@ -690,7 +690,7 @@ class GeneratorScriptRuntimeTest(unittest.TestCase):
                             server_address,
                             5,
                             str(pid_file),
-                            os.path.realpath(sys.executable),
+                            generator_ipc._get_process_image_path(os.getpid()),
                         )
 
                         for _ in range(2):
