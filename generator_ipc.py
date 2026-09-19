@@ -664,6 +664,39 @@ def _normalize_process_image_path(process_path):
     return normalized
 
 
+def _iter_current_interpreter_image_paths():
+    candidates = [sys.executable, getattr(sys, "_base_executable", None)]
+    own_image_path = _get_process_image_path(os.getpid())
+    if own_image_path:
+        candidates.append(own_image_path)
+    seen_paths = set()
+    for candidate in candidates:
+        normalized_path = _normalize_process_image_path(candidate)
+        if not normalized_path or normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        yield normalized_path
+
+
+def _process_image_path_matches(actual_process_path, expected_process_path):
+    normalized_expected_path = _normalize_process_image_path(
+        expected_process_path)
+    if not normalized_expected_path:
+        return True
+    normalized_actual_path = _normalize_process_image_path(actual_process_path)
+    if not normalized_actual_path:
+        return False
+    if normalized_actual_path == normalized_expected_path:
+        return True
+    # Windows venvs since Python 3.14 run the base interpreter behind the
+    # venv's python.exe stub, so sys.executable and the live process image can
+    # be different files for the same running interpreter. Treat paths as
+    # equivalent when both identify the current interpreter.
+    current_interpreter_paths = set(_iter_current_interpreter_image_paths())
+    return (normalized_actual_path in current_interpreter_paths and
+            normalized_expected_path in current_interpreter_paths)
+
+
 def _check_pid_file_process(pid_file, expected_process_path):
     pid = _read_pid_file(pid_file)
     if pid is None:
@@ -672,10 +705,7 @@ def _check_pid_file_process(pid_file, expected_process_path):
     if not process_path:
         return (False, "pid {0} from {1} is not running".format(
             pid, pid_file))
-    normalized_process_path = _normalize_process_image_path(process_path)
-    normalized_expected_path = _normalize_process_image_path(
-        expected_process_path)
-    if normalized_expected_path and normalized_process_path != normalized_expected_path:
+    if not _process_image_path_matches(process_path, expected_process_path):
         return (
             False,
             "pid {0} process path mismatch: {1} != {2}".format(
@@ -695,10 +725,7 @@ def _discard_stale_pid_file(pid_file, expected_process_path):
     if not process_path:
         _remove_pid_file(pid_file)
         return
-    normalized_process_path = _normalize_process_image_path(process_path)
-    normalized_expected_path = _normalize_process_image_path(
-        expected_process_path)
-    if normalized_expected_path and normalized_process_path != normalized_expected_path:
+    if not _process_image_path_matches(process_path, expected_process_path):
         _remove_pid_file(pid_file)
 
 
@@ -718,11 +745,8 @@ def _check_server_ping_response(response, pid_file, expected_process_path):
                 response_pid, pid),
         )
     response_process_path = response.get("process_path")
-    normalized_response_path = _normalize_process_image_path(
-        response_process_path)
-    normalized_expected_path = _normalize_process_image_path(
-        expected_process_path)
-    if normalized_expected_path and normalized_response_path != normalized_expected_path:
+    if not _process_image_path_matches(response_process_path,
+                                       expected_process_path):
         return (
             False,
             "generator server process path mismatch: {0} != {1}".format(
