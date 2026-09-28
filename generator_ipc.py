@@ -8,6 +8,7 @@ Local IPC helpers for generate-for-pb scripts.
 
 import base64
 import contextlib
+import errno
 import importlib
 import io
 import json
@@ -536,7 +537,7 @@ def _get_generator_server_startup_lock_file(pid_file, address, cwd):
     )
 
 
-def _write_lock_file(lock_file, pid):
+def _acquire_generator_server_startup_lock(lock_file, timeout):
     lock_file_dir = os.path.dirname(os.path.abspath(lock_file))
     if lock_file_dir and not os.path.exists(lock_file_dir):
         try:
@@ -545,41 +546,39 @@ def _write_lock_file(lock_file, pid):
             if not os.path.isdir(lock_file_dir):
                 raise
 
-    open_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_BINARY"):
-        open_flags |= os.O_BINARY
-    fd = os.open(lock_file, open_flags, 0o644)
+    # Keep one stable file: unlinking it can give waiters different inodes.
+    # OS locks also survive the create-before-write window and are released
+    # when a client exits, without guessing whether a PID file is stale.
+    lock_stream = open(lock_file, "a+b", buffering=0)
+    deadline = time.monotonic() + max(timeout, 0.1)
     try:
-        with os.fdopen(fd, "w") as file_obj:
-            file_obj.write("{0}\n".format(pid))
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    lock_stream.seek(0)
+                    msvcrt.locking(lock_stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lock_stream.fileno(),
+                                fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return lock_stream
+            except OSError as e:
+                if e.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if time.monotonic() >= deadline:
+                    lock_stream.close()
+                    return None
+                time.sleep(0.05)
     except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        lock_stream.close()
         raise
 
 
-def _acquire_generator_server_startup_lock(lock_file, timeout,
-                                           expected_process_path):
-    deadline = time.monotonic() + max(timeout, 0.1)
-    while True:
-        try:
-            _write_lock_file(lock_file, os.getpid())
-            return True
-        except FileExistsError:
-            lock_ready, _lock_error = _check_pid_file_process(
-                lock_file, expected_process_path)
-            if not lock_ready:
-                _remove_pid_file(lock_file)
-                continue
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.05)
-
-
-def _release_generator_server_startup_lock(lock_file):
-    _remove_pid_file_if_match(lock_file, os.getpid())
+def _release_generator_server_startup_lock(lock_stream):
+    lock_stream.close()
 
 
 def _get_windows_process_image_path(pid):
@@ -1316,8 +1315,10 @@ def _run_generator_server_impl(address,
     finally:
         server.stop_idle_monitor()
         server.server_close()
-        _remove_pid_file_if_match(pid_file, os.getpid())
+        # Keep the PID until port cleanup finishes, so a replacement cannot
+        # publish a reused port while the old server still removes its files.
         _remove_server_port_file_if_match(port_file, port)
+        _remove_pid_file_if_match(pid_file, os.getpid())
     return 0
 
 
@@ -1411,7 +1412,6 @@ def _wait_generator_server_ready(address,
                 pid_file_ready, pid_file_error = _check_pid_file_process(
                     pid_file, expected_process_path)
                 if not pid_file_ready:
-                    _discard_stale_pid_file(pid_file, expected_process_path)
                     last_error = RuntimeError(pid_file_error)
                     time.sleep(0.05)
                     continue
@@ -1475,10 +1475,8 @@ def run_generator_client(address,
             pid_file_ready, pid_file_error = _check_pid_file_process(
                 pid_file, expected_process_path)
             if not pid_file_ready:
-                if not shutdown:
-                    _discard_stale_pid_file(pid_file, expected_process_path)
-                    _remove_server_port_file_if_match(
-                        port_file, _read_server_port_file(port_file))
+                # A different client may be publishing the server state.
+                # Probes must stay read-only until we own the startup lock.
                 raise RuntimeError(pid_file_error)
             _ping_generator_server(resolved_address, connect_timeout, timeout,
                                    pid_file, expected_process_path)
@@ -1487,17 +1485,22 @@ def run_generator_client(address,
                                         request)
     except BaseException as e:
         if shutdown:
-            pid_file_ready = False
-            if pid_file:
-                pid_file_ready, _pid_file_error = _check_pid_file_process(
-                    pid_file, expected_process_path)
-                if not pid_file_ready:
-                    _remove_pid_file(pid_file)
-                    _remove_server_port_file_if_match(
-                        port_file, _read_server_port_file(port_file))
-            else:
-                _remove_server_port_file_if_match(
-                    port_file, _read_server_port_file(port_file))
+            startup_lock_file = _get_generator_server_startup_lock_file(
+                pid_file, address, cwd)
+            lock_stream = _acquire_generator_server_startup_lock(
+                startup_lock_file, min(max(timeout, 1.0), 10.0))
+            if lock_stream:
+                try:
+                    pid_file_ready = False
+                    if pid_file:
+                        pid_file_ready, _pid_file_error = _check_pid_file_process(
+                            pid_file, expected_process_path)
+                    if not pid_file_ready:
+                        _remove_server_port_file_if_match(
+                            port_file, _read_server_port_file(port_file))
+                        _discard_stale_pid_file(pid_file, expected_process_path)
+                finally:
+                    _release_generator_server_startup_lock(lock_stream)
             return 0
         if not auto_start:
             sys.stderr.write(
@@ -1507,14 +1510,13 @@ def run_generator_client(address,
             startup_timeout = min(max(timeout, 1.0), 10.0)
             startup_lock_file = _get_generator_server_startup_lock_file(
                 pid_file, address, cwd)
-            startup_lock_acquired = False
+            startup_lock = None
             try:
                 server_ready = False
                 if startup_lock_file:
-                    startup_lock_acquired = _acquire_generator_server_startup_lock(
-                        startup_lock_file, startup_timeout,
-                        expected_process_path)
-                    if not startup_lock_acquired:
+                    startup_lock = _acquire_generator_server_startup_lock(
+                        startup_lock_file, startup_timeout)
+                    if not startup_lock:
                         _wait_generator_server_ready(address, startup_timeout,
                                                      pid_file,
                                                      expected_process_path,
@@ -1572,8 +1574,8 @@ def run_generator_client(address,
                                                  port_file,
                                                  bool(port_range))
             finally:
-                if startup_lock_acquired and startup_lock_file:
-                    _release_generator_server_startup_lock(startup_lock_file)
+                if startup_lock:
+                    _release_generator_server_startup_lock(startup_lock)
 
             response = _connect_and_request(
                                             _resolve_generator_server_address(
