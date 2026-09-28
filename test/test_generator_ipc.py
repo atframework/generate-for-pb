@@ -165,6 +165,36 @@ class GeneratorIpcClientTest(unittest.TestCase):
         self.assertEqual(0, result)
         self.assertEqual("", stderr.getvalue())
 
+    def test_run_generator_client_shutdown_handles_inaccessible_startup_lock(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            port_file = Path(temp_dir) / "server.port"
+            port_file.write_text("3701\n", encoding="utf-8")
+            stderr = io.StringIO()
+
+            with mock.patch.object(generator_ipc,
+                                   "_connect_and_request",
+                                   side_effect=ConnectionRefusedError("refused")), \
+                    mock.patch.object(generator_ipc,
+                                      "_acquire_generator_server_startup_lock",
+                                      side_effect=PermissionError("lock is not writable")):
+                with contextlib.redirect_stderr(stderr):
+                    result = generator_ipc.run_generator_client(
+                        TEST_SERVER_ADDRESS,
+                        1,
+                        [],
+                        temp_dir,
+                        "generator.py",
+                        True,
+                        auto_start=False,
+                        pid_file=None,
+                        port_file=str(port_file),
+                    )
+
+            self.assertEqual(0, result)
+            self.assertEqual(3701,
+                             generator_ipc._read_server_port_file(str(port_file)))
+            self.assertEqual("", stderr.getvalue())
+
     def test_run_generator_client_waits_for_existing_startup(self):
         with mock.patch.object(generator_ipc,
                                "_connect_and_request",

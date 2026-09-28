@@ -1485,10 +1485,15 @@ def run_generator_client(address,
                                         request)
     except BaseException as e:
         if shutdown:
-            startup_lock_file = _get_generator_server_startup_lock_file(
-                pid_file, address, cwd)
-            lock_stream = _acquire_generator_server_startup_lock(
-                startup_lock_file, min(max(timeout, 1.0), 10.0))
+            try:
+                startup_lock_file = _get_generator_server_startup_lock_file(
+                    pid_file, address, cwd)
+                lock_stream = _acquire_generator_server_startup_lock(
+                    startup_lock_file, min(max(timeout, 1.0), 10.0))
+            except OSError:
+                # Shutdown is best-effort. Without the lock, we cannot safely
+                # distinguish stale files from a server still starting.
+                return 0
             if lock_stream:
                 try:
                     pid_file_ready = False
